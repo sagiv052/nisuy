@@ -440,7 +440,7 @@ class Catalog:
         with self._connect() as connection:
             return self._execute(connection, "SELECT 1 FROM bot_chats WHERE chat_id = ? AND active = 1", (chat_id,)).fetchone() is not None
 
-    def integrity_report(self) -> dict[str, list[dict[str, Any]]]:
+    def integrity_report(self) -> dict[str, Any]:
         with self._connect() as connection:
             duplicate_rows: list[dict[str, Any]] = self._execute(connection, """SELECT kind, lower(trim(title)) AS normalized_title,
                 MIN(title) AS title, STRING_AGG(CAST(id AS TEXT), ',') AS item_ids, COUNT(*) AS count
@@ -454,6 +454,8 @@ class Catalog:
                 seasons.season_number, GROUP_CONCAT(episodes.episode_number) AS episode_numbers FROM items
                 JOIN seasons ON seasons.series_id = items.id LEFT JOIN episodes ON episodes.season_id = seasons.id
                 WHERE items.kind = 'series' GROUP BY items.id, items.title, seasons.season_number ORDER BY items.title, seasons.season_number""").fetchall()
+            item_rows = self._execute(connection, "SELECT id, title, kind, poster_url, summary FROM items ORDER BY kind, title").fetchall()
+
         duplicates: list[dict[str, Any]] = [{"kind": row["kind"], "title": row["title"], "item_ids": sorted(int(value) for value in row["item_ids"].split(",")), "count": int(row["count"])} for row in duplicate_rows]
         missing_episodes: list[dict[str, Any]] = []
         for row in series_rows:
@@ -465,7 +467,25 @@ class Catalog:
             missing = sorted(set(range(numbers[0], numbers[-1] + 1)) - set(numbers))
             if missing:
                 missing_episodes.append({"series_id": int(row["series_id"]), "series_title": row["series_title"], "season_number": int(row["season_number"]), "missing_episodes": missing})
-        return {"duplicates": duplicates, "missing_episodes": missing_episodes}
+
+        missing_posters: list[dict[str, Any]] = []
+        empty_summaries: list[dict[str, Any]] = []
+        for row in item_rows:
+            item_id = int(row["id"] if self.is_postgres else row[0])
+            title = str(row["title"] if self.is_postgres else row[1])
+            poster_url = str(row["poster_url"] if self.is_postgres else row[3])
+            summary = str(row["summary"] if self.is_postgres else row[4])
+            if not poster_url.strip():
+                missing_posters.append({"item_id": item_id, "title": title, "kind": row["kind"] if self.is_postgres else row[2]})
+            if not summary.strip():
+                empty_summaries.append({"item_id": item_id, "title": title, "kind": row["kind"] if self.is_postgres else row[2]})
+
+        return {
+            "duplicates": duplicates,
+            "missing_episodes": missing_episodes,
+            "missing_posters": missing_posters,
+            "empty_summaries": empty_summaries,
+        }
 
     def close(self) -> None:
         """Compatibility hook; connections are short-lived and closed per operation."""

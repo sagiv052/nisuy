@@ -158,6 +158,24 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(item["quality"], "1080P BluRay remux")
             self.assertEqual(reopened_item["quality"], "1080P BluRay remux")
 
+    def test_integrity_report_tracks_missing_posters_and_empty_summaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            catalog = Catalog(str(Path(directory) / "catalog.db"))
+            catalog.add_item("movie", "Missing Poster", poster_url="")
+            catalog.add_item("movie", "Empty Summary", summary="")
+            catalog.add_item("series", "Series With Poster", poster_url="https://example.com/poster.jpg", summary="Good summary")
+
+            report = catalog.integrity_report()
+
+            self.assertIn(
+                {"item_id": 1, "title": "Missing Poster", "kind": "movie"},
+                report["missing_posters"],
+            )
+            self.assertIn(
+                {"item_id": 2, "title": "Empty Summary", "kind": "movie"},
+                report["empty_summaries"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

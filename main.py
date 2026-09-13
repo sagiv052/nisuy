@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from difflib import SequenceMatcher
 import httpx
 from pathlib import Path
 from urllib.parse import urlparse
@@ -118,6 +119,36 @@ stats: dict[str, Any] = {
     "last_file": None,
     "last_ping": None,
 }
+STATE_TTL_SECONDS = max(60, int(os.environ.get("STATE_TTL_SECONDS", "600")))
+STATE_CLEANUP_INTERVAL = max(30, int(os.environ.get("STATE_CLEANUP_INTERVAL", "120")))
+
+
+def cleanup_expired_state() -> None:
+    now = time.time()
+    expired_user_ids = [
+        user_id
+        for user_id, state in user_states.items()
+        if now - float(state.get("updated_at", now)) > STATE_TTL_SECONDS
+    ]
+    for user_id in expired_user_ids:
+        user_states.pop(user_id, None)
+
+    expired_batch_users = [
+        user_id
+        for user_id, state in auto_batch_states.items()
+        if now - float(state.get("updated_at", now)) > STATE_TTL_SECONDS
+    ]
+    for user_id in expired_batch_users:
+        auto_batch_states.pop(user_id, None)
+        task = auto_batch_tasks.pop(user_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+
+async def cleanup_state_loop() -> None:
+    while True:
+        cleanup_expired_state()
+        await asyncio.sleep(STATE_CLEANUP_INTERVAL)
 
 def _catalog_database_path() -> str:
     configured_raw = os.environ.get("CATALOG_DB", "").strip()
@@ -330,11 +361,13 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     await bot_client.start()
     keep_alive_task = asyncio.create_task(keep_alive())
     catalog_sync_task = asyncio.create_task(catalog_sync_loop())
+    cleanup_task = asyncio.create_task(cleanup_state_loop())
     log.info("All systems ready ✅ BASE_URL=%s", BASE_URL)
     try:
         yield
     finally:
         catalog_sync_task.cancel()
+        cleanup_task.cancel()
         await sync_catalog_snapshot()
         keep_alive_task.cancel()
         await send_heartbeat("shutdown")
@@ -820,12 +853,50 @@ async def handle_photo_metadata(client: Client, message: Message):
         return
     user_id = message.from_user.id if message.from_user else 0
     metadata_text = (message.caption or "").strip()
-    if not metadata_text:
+    parsed_caption = parse_media_caption(metadata_text) if metadata_text else None
+
+    if parsed_caption is None:
+        parsed_caption = pending_metadata_by_user.get(user_id)
+
+    poster_url = ""
+    if message.photo and CLOUDINARY_STORAGE.enabled:
+        try:
+            cloudinary_result = await CLOUDINARY_STORAGE.upload_downloaded_media(
+                client,
+                message,
+                chat_id=int(message.chat.id),
+                message_id=int(message.id),
+                file_name=f"poster-{message.id}.jpg",
+                mime_type="image/jpeg",
+            )
+            poster_url = CLOUDINARY_STORAGE.storage_url(cloudinary_result)
+        except Exception:
+            log.exception(
+                "Could not upload photo poster for %s/%s",
+                message.chat.id,
+                message.id,
+            )
+
+    if parsed_caption is None and not poster_url:
+        await reply(message, "📷 קיבלתי את התמונה. שלח גם כיתוב עם שם הסדרה/הסרט כדי להשתמש בה כפוסטר.")
         return
-    parsed_caption = parse_media_caption(metadata_text)
-    if not parsed_caption:
+
+    if parsed_caption is not None:
+        if poster_url:
+            parsed_caption = dict(parsed_caption)
+            parsed_caption["poster_url"] = poster_url
+        pending_metadata_by_user[user_id] = parsed_caption
+
+        existing_link_message = attach_metadata_to_existing_catalog(parsed_caption)
+        if existing_link_message:
+            await reply(message, existing_link_message)
+            return
+
+    if poster_url and parsed_caption is None:
+        pending_metadata_by_user[user_id] = {"poster_url": poster_url}
+        await reply(message, "📷 הפוסטר הועלה והוכן לשימוש. שלח עכשיו את פרטי הסדרה/הסרט כדי לחבר אותו.")
         return
-    pending_metadata_by_user[user_id] = parsed_caption
+
     await reply(message, "✅ שמרתי את פרטי הסדרה/הפוסטר. אפשר לשלוח עכשיו את הקבצים.")
 
 
@@ -836,6 +907,8 @@ async def handle_media(client: Client, message: Message):
     stats["files_processed"] += 1
     user_id = message.from_user.id if message.from_user else 0
     state = user_states.get(user_id)
+    if state is not None:
+        state["updated_at"] = time.time()
     is_batch_upload = is_batch_upload_state(state)
     batch_lock: Optional[asyncio.Lock] = None
     if is_batch_upload:
@@ -945,7 +1018,7 @@ async def handle_media(client: Client, message: Message):
         metadata_text = message.caption or re.sub(
             r"[._]+", " ", Path(file_name or "").stem
         )
-        pending_metadata = pending_metadata_by_user.get(user_id)
+        pending_metadata = pending_metadata_by_user.pop(user_id, None)
         parsed_caption = parse_media_caption(metadata_text)
         if pending_metadata:
             parsed_caption = merge_pending_metadata(parsed_caption, pending_metadata)
@@ -1558,15 +1631,71 @@ async def auto_catalog_media(
 
 
 def begin_flow(user_id: int, flow: str) -> None:
-    user_states[user_id] = {"flow": flow, "step": "title", "data": {}}
+    user_states[user_id] = {"flow": flow, "step": "title", "data": {}, "updated_at": time.time()}
+
+
+def normalize_title_for_lookup(value: str) -> str:
+    text = re.sub(r"[*_`>#]", " ", value or "")
+    text = re.sub(r"\b(?:עונה|season|s)\s*\d+\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:פרק|episode|ep|e)\s*\d+\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:1080p|720p|2160p|480p|web[- ]?dl|x265|x264|hdrip|dvdrip|bluray|remux|mkv|mp4|avi|m4v|webm)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:translated|תרגום|subtitle|subtitles|written|דובב|מדובב|כתוביות)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[\[\](){}]", " ", text)
+    text = re.sub(r"[-_]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" -:;,. ").casefold()
+
+
+def title_similarity(lhs: str, rhs: str) -> float:
+    if not lhs or not rhs:
+        return 0.0
+    if lhs == rhs:
+        return 1.0
+    return SequenceMatcher(None, lhs, rhs).ratio()
 
 
 def find_item(query: str, kind: Optional[str] = None) -> Optional[dict[str, Any]]:
-    results = CATALOG.search(query, kind)
-    if not results:
-        return None
-    exact = [item for item in results if item["title"].casefold() == query.casefold()]
-    return exact[0] if exact else results[0]
+    search_results = CATALOG.search(query, kind)
+    if search_results:
+        exact = [item for item in search_results if item["title"].casefold() == query.casefold()]
+        if exact:
+            return exact[0]
+
+    normalized_query = normalize_title_for_lookup(query)
+    all_items = CATALOG.list_items(kind)
+    if not all_items:
+        return search_results[0] if search_results else None
+
+    scored_items: list[tuple[float, dict[str, Any]]] = []
+    for item in all_items:
+        normalized_title = normalize_title_for_lookup(item["title"])
+        if not normalized_title:
+            continue
+        score = title_similarity(normalized_query, normalized_title)
+        if score >= 0.75:
+            scored_items.append((score, item))
+
+    if scored_items:
+        scored_items.sort(key=lambda entry: entry[0], reverse=True)
+        best_match = scored_items[0][1]
+        return best_match
+
+    return search_results[0] if search_results else None
+
+
+def find_exact_item(query: str, kind: Optional[str] = None) -> Optional[dict[str, Any]]:
+    normalized_query = normalize_title_for_lookup(query)
+    search_results = CATALOG.search(query, kind)
+    if search_results:
+        for item in search_results:
+            if normalize_title_for_lookup(item["title"]) == normalized_query:
+                return item
+
+    all_items = CATALOG.list_items(kind)
+    for item in all_items:
+        if normalize_title_for_lookup(item["title"]) == normalized_query:
+            return item
+    return None
 
 
 def attach_metadata_to_existing_catalog(parsed_caption: dict[str, Any]) -> Optional[str]:
@@ -1589,12 +1718,12 @@ def attach_metadata_to_existing_catalog(parsed_caption: dict[str, Any]) -> Optio
 
     if kind == "episode":
         for candidate in candidates:
-            item = find_item(candidate, "series")
+            item = find_exact_item(candidate, "series")
             if item:
                 break
     else:
         for candidate in candidates:
-            item = find_item(candidate, kind)
+            item = find_exact_item(candidate, kind)
             if item:
                 break
 
@@ -2369,6 +2498,9 @@ async def text_router(client: Client, message: Message):
         return
     text = (message.text or "").strip()
     user_id = message.from_user.id if message.from_user else 0
+    state = user_states.get(user_id)
+    if state is not None:
+        state["updated_at"] = time.time()
     if looks_like_metadata(text):
         parsed_caption = parse_media_caption(text)
         if parsed_caption:
