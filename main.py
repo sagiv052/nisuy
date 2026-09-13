@@ -150,6 +150,26 @@ async def cleanup_state_loop() -> None:
         cleanup_expired_state()
         await asyncio.sleep(STATE_CLEANUP_INTERVAL)
 
+
+def schedule_pending_metadata_confirmation(user_id: int, message: Message, text: str) -> None:
+    existing_task = pending_metadata_confirmation_tasks.pop(user_id, None)
+    if existing_task is not None and not existing_task.done():
+        existing_task.cancel()
+
+    async def _deliver_confirmation() -> None:
+        try:
+            await asyncio.sleep(1.5)
+            if pending_metadata_by_user.get(user_id) is None:
+                return
+            await reply(message, text)
+        except asyncio.CancelledError:
+            return
+        finally:
+            pending_metadata_confirmation_tasks.pop(user_id, None)
+
+    pending_metadata_confirmation_tasks[user_id] = asyncio.create_task(_deliver_confirmation())
+
+
 def _catalog_database_path() -> str:
     configured_raw = os.environ.get("CATALOG_DB", "").strip()
     configured_path = Path(configured_raw) if configured_raw else Path("catalog.db")
@@ -262,6 +282,7 @@ CATALOG.add_user(OWNER_USER_ID, OWNER_USER_ID)
 ADMIN_USER_IDS = set(CATALOG.list_admins()) | {OWNER_USER_ID}
 user_states: dict[int, dict[str, Any]] = {}
 pending_metadata_by_user: dict[int, dict[str, Any]] = {}
+pending_metadata_confirmation_tasks: dict[int, asyncio.Task[None]] = {}
 auto_batch_states: dict[int, dict[str, Any]] = {}
 auto_batch_tasks: dict[int, asyncio.Task[None]] = {}
 auto_batch_locks: dict[int, asyncio.Lock] = {}
@@ -892,12 +913,23 @@ async def handle_photo_metadata(client: Client, message: Message):
             await reply(message, existing_link_message)
             return
 
-    if poster_url and parsed_caption is None:
-        pending_metadata_by_user[user_id] = {"poster_url": poster_url}
-        await reply(message, "📷 הפוסטר הועלה והוכן לשימוש. שלח עכשיו את פרטי הסדרה/הסרט כדי לחבר אותו.")
+        schedule_pending_metadata_confirmation(
+            user_id,
+            message,
+            "✅ שמרתי את פרטי הסדרה/הפוסטר. אפשר לשלוח עכשיו את הקבצים.",
+        )
         return
 
-    await reply(message, "✅ שמרתי את פרטי הסדרה/הפוסטר. אפשר לשלוח עכשיו את הקבצים.")
+    if poster_url and parsed_caption is None:
+        pending_metadata_by_user[user_id] = {"poster_url": poster_url}
+        schedule_pending_metadata_confirmation(
+            user_id,
+            message,
+            "📷 הפוסטר הועלה והוכן לשימוש. שלח עכשיו את פרטי הסדרה/הסרט כדי לחבר אותו.",
+        )
+        return
+
+    await reply(message, "📷 קיבלתי את התמונה. שלח גם כיתוב עם שם הסדרה/הסרט כדי להשתמש בה כפוסטר.")
 
 
 @bot_client.on_message((filters.private | filters.group | filters.channel) & (filters.video | filters.audio | filters.document | filters.video_note))  # type: ignore[reportUnknownMemberType, reportUntypedFunctionDecorator]
@@ -1018,10 +1050,23 @@ async def handle_media(client: Client, message: Message):
         metadata_text = message.caption or re.sub(
             r"[._]+", " ", Path(file_name or "").stem
         )
+        confirmation_task = pending_metadata_confirmation_tasks.pop(user_id, None)
+        if confirmation_task is not None and not confirmation_task.done():
+            confirmation_task.cancel()
         pending_metadata = pending_metadata_by_user.pop(user_id, None)
         parsed_caption = parse_media_caption(metadata_text)
         if pending_metadata:
             parsed_caption = merge_pending_metadata(parsed_caption, pending_metadata)
+        metadata_saved_for_batch = bool(
+            pending_metadata is not None
+            or (
+                parsed_caption is not None
+                and any(
+                    parsed_caption.get(field)
+                    for field in ("summary", "genre", "year", "poster_url", "quality")
+                )
+            )
+        )
         if parsed_caption:
             auto_batch_lock: Optional[asyncio.Lock] = None
             if parsed_caption.get("kind") == "episode":
@@ -1040,8 +1085,10 @@ async def handle_media(client: Client, message: Message):
                             "saved_items": [],
                             "groups": {},
                             "last_message": message,
+                            "metadata_saved": False,
                         },
                     )
+                    batch_state["metadata_saved"] = bool(batch_state.get("metadata_saved", False) or metadata_saved_for_batch)
                     batch_state["failed"] = int(batch_state.get("failed", 0)) + 1
                     batch_state["failed_episodes"].append(
                         (parsed_caption.get("season"), parsed_caption.get("episode"))
@@ -1065,8 +1112,10 @@ async def handle_media(client: Client, message: Message):
                         "saved_items": [],
                         "groups": {},
                         "last_message": message,
+                        "metadata_saved": False,
                     },
                 )
+                batch_state["metadata_saved"] = bool(batch_state.get("metadata_saved", False) or metadata_saved_for_batch)
                 batch_state["uploaded"] = int(batch_state.get("uploaded", 0)) + 1
                 group = str(parsed_caption.get("title_candidates", ["לא ידוע"])[0])
                 batch_state.setdefault("groups", {}).setdefault(group, {"uploaded": 0, "failed": 0})["uploaded"] += 1
@@ -1251,6 +1300,12 @@ async def flush_auto_batch_summary(user_id: int) -> None:
             f"✅ נשמרו בהצלחה: {state.get('uploaded', 0)}",
             f"❌ נכשלו: {state.get('failed', 0)}",
         ]
+
+        if state.get("metadata_saved"):
+            lines.extend([
+                "",
+                "✅ נשמרו גם פרטי המידע (תקציר, זאנר, שנה, פוסטר) יחד עם הפרקים.",
+            ])
 
         groups = state.get("groups", {})
         if groups:
