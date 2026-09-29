@@ -1,0 +1,18 @@
+{
+  "name": "flight-bot-whatsapp-web",
+  "private": true,
+  "version": "1.0.0",
+  "description": "WhatsApp Web companion for the flight bot",
+  "main": "whatsapp_bot.js",
+  "scripts": {
+    "start": "node whatsapp_bot.js",
+    "dev": "node dev_watch.js",
+    "test": "node --test",
+    "test:python": "./.venv/bin/python -m unittest discover -s test -p 'test_*.py'"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.34.2"
+  }
+}

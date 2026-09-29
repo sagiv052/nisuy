@@ -1,0 +1,17 @@
+.env
+*.sqlite3
+*.sqlite3-*
+browser-profile/
+.wwebjs_auth/
+.wwebjs_cache/
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+playwright/.cache/
+test-results/
+*.log
+.DS_Store
+__MACOSX/
