@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
@@ -37,6 +38,12 @@ def normalize(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
+def normalize_location(value: Any) -> str:
+    value = unicodedata.normalize("NFKD", str(value or "").casefold())
+    value = "".join(character for character in value if not unicodedata.combining(character))
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", value)).strip()
+
+
 def normalize_airline(value: Any) -> str:
     value = re.sub(r"[^\w\s]", "", str(value or "").strip().casefold())
     return re.sub(r"\s+", " ", value)
@@ -54,8 +61,41 @@ def load_airlines() -> list[dict[str, Any]]:
 AIRLINES = load_airlines()
 
 
+def _edit_distance(left: str, right: str, limit: int) -> int:
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous = list(range(len(right) + 1))
+    for left_index, left_char in enumerate(left, start=1):
+        current = [left_index]
+        row_minimum = left_index
+        for right_index, right_char in enumerate(right, start=1):
+            cost = 0 if left_char == right_char else 1
+            current.append(min(
+                previous[right_index] + 1,
+                current[right_index - 1] + 1,
+                previous[right_index - 1] + cost,
+            ))
+            row_minimum = min(row_minimum, current[-1])
+        if row_minimum > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
 def airline_matches(text: str) -> list[dict[str, Any]]:
     needle = normalize_airline(text)
+    needle = re.split(r"\s+(?:עם\s+)?(?:איזו|איזה)\s+חברת(?:\s+תעופה)?\b", needle, maxsplit=1)[0].strip()
+    needle = re.split(r"\s+(?:כתוב|כתבי)\s+(?:את\s+)?(?:השם|שם)\b", needle, maxsplit=1)[0].strip()
+    # Keep replies tied to the airline question even when the user says
+    # "sorry", "I meant", or "no, the airline is ..." before the name.
+    needle = re.sub(r"^(?:(?:לא|סליחה|טעיתי|טעות|תיקון|התיקון|התכוונתי|כלומר|רציתי)(?:\s+הוא)?\s+)+", "", needle)
+    needle = re.sub(r"^ל\s+", "", needle)
+    needle = re.sub(r"^ל(?=אל\s)", "", needle)
+    # Accept a carrier name even when the user repeats it inside a sentence or
+    # pastes the bot's airline prompt along with the answer.
+    query = re.search(r"(?:^|\s)(?:עם\s+(?:(?:חברת(?:\s+התעופה)?|חברת\s+תעופה)\s+)?|חברת(?:\s+התעופה)?\s+)(.+)$", needle)
+    if query:
+        needle = query.group(1).strip()
     if not needle:
         return []
 
@@ -68,7 +108,29 @@ def airline_matches(text: str) -> list[dict[str, Any]]:
     for airline in candidates:
         key = normalize_airline(airline.get("iata", "")) or normalize_airline(airline.get("name_en", ""))
         unique.setdefault(key, airline)
-    return list(unique.values())
+    if unique:
+        return list(unique.values())
+
+    # A very small typo allowance catches common one-letter errors such as
+    # "הלעל" without guessing when two carriers are equally close.
+    max_distance = 1 if len(needle) < 8 else 2
+    closest: dict[str, tuple[int, dict[str, Any]]] = {}
+    best_distance = max_distance + 1
+    for airline in AIRLINES:
+        key = normalize_airline(airline.get("iata", "")) or normalize_airline(airline.get("name_en", ""))
+        airline_distance = min(
+            (_edit_distance(needle, normalize_airline(value), max_distance)
+             for value in values(airline) if normalize_airline(value)),
+            default=max_distance + 1,
+        )
+        if airline_distance < best_distance:
+            best_distance = airline_distance
+            closest = {key: (airline_distance, airline)}
+        elif airline_distance == best_distance and airline_distance <= max_distance:
+            closest.setdefault(key, (airline_distance, airline))
+    if best_distance <= max_distance and len(closest) == 1:
+        return [next(iter(closest.values()))[1]]
+    return []
 
 
 @dataclass(frozen=True)
@@ -97,12 +159,14 @@ class FlightBoardClient:
                 for field in form.select("input, select")
                 if field.get("name") and field.get("name") != "g-recaptcha-response"
             }
-            city = self._official_city(form, query.location)
+            # If the free-form city is not one of the current dropdown options,
+            # query the board without a city filter and match its returned rows below.
+            city_filter, city_label = self._official_city(form, query.location)
             form_data.update({
                 "FlightType": flight_type,
                 "AirportId": "LLBG",
                 "UICulture": "he-IL",
-                "City": city,
+                "City": city_filter,
                 "Country": "",
                 "AirlineCompany": "",
                 "FromDate": query.flight_date.strftime("%d/%m/%Y"),
@@ -111,18 +175,19 @@ class FlightBoardClient:
             response = await client.post(IAA_SEARCH_URL, data=form_data, headers={"Referer": str(page.url), "X-Requested-With": "XMLHttpRequest"})
             response.raise_for_status()
             payload = response.json()
-            effective_query = replace(query, location=city or query.location)
+            effective_query = replace(query, location=city_label or query.location)
             results = [self._api_row(row, effective_query) for row in payload.get("Flights", [])]
             return sorted((result for result in results if self._matches(result, effective_query)), key=lambda result: result.get("scheduled_time") or "99:99")
 
     @staticmethod
-    def _official_city(form: Any, location: str) -> str:
-        needle = normalize(location)
+    def _official_city(form: Any, location: str) -> tuple[str, str]:
+        needle = normalize_location(location)
         options = form.select("#City option")
-        exact = next((option.get("value", "") for option in options if normalize(option.get_text(" ", strip=True)) == needle), "")
-        if exact:
-            return exact
-        return next((option.get("value", "") for option in options if normalize(option.get_text(" ", strip=True)) in needle or needle in normalize(option.get_text(" ", strip=True))), location)
+        exact = next((option for option in options if normalize_location(option.get_text(" ", strip=True)) == needle), None)
+        matched = exact or next((option for option in options if normalize_location(option.get_text(" ", strip=True)) in needle or needle in normalize_location(option.get_text(" ", strip=True))), None)
+        if not matched:
+            return "", ""
+        return str(matched.get("value", "")), matched.get_text(" ", strip=True)
 
     @staticmethod
     def _api_row(row: dict[str, Any], query: FlightQuery) -> dict[str, Any]:
@@ -194,7 +259,9 @@ class FlightBoardClient:
             name = normalize(query.airline.get("name_en", ""))
             if code not in row["flight_number"] and name not in normalize(row["airline"]):
                 return False
-        return normalize(query.location) in normalize(row["location"]) or normalize(row["location"]) in normalize(query.location)
+        query_location = normalize_location(query.location)
+        row_location = normalize_location(row["location"])
+        return query_location in row_location or row_location in query_location
 
 
 class Database:

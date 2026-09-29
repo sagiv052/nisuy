@@ -92,6 +92,16 @@ function isNoiseMessage(text) {
   return !/[א-תA-Za-z]/.test(text) && !/[!]/.test(text) && /^[\d\s.,!?؛،…_-]+$/.test(text);
 }
 
+function isCheckOnlyCommand(text) {
+  return ["בדיקה", "בדיקת", "בדיקת טיסה", "בדוק לי", "בדוק לי טיסה", "תבדוק לי", "תבדוק לי משהו", "אני רוצה בדיקה", "אני צריך בדיקה", "אני רוצה שתבדוק לי משהו"]
+    .includes(String(text || "").trim().toLocaleLowerCase("he-IL").replace(/[.!?,؛،]/g, ""));
+}
+
+async function requestAirlineCorrection(message, naturalSearch) {
+  sessions.set(message.from, { ...naturalSearch, step: "natural_airline" });
+  await message.reply("⚠️ לא זיהיתי את חברת התעופה, אבל שמרתי את פרטי הטיסה בשיחה. שלח את שם החברה או קוד IATA מתוקן — אפשר לכתוב רק את התיקון, למשל: \"התכוונתי ל־[שם החברה]\".");
+}
+
 async function executeNaturalSearch(message, naturalSearch) {
   if (naturalSearch.roundTrip) {
     const legs = [];
@@ -100,7 +110,7 @@ async function executeNaturalSearch(message, naturalSearch) {
         ? await runFlightService({ action: "airline_matches", text: leg.airline_text })
         : { matches: [] };
       if (leg.airline_text && !airlineResponse.matches.length) {
-        await message.reply("⚠️ לא זיהיתי את חברת התעופה. נסה לכתוב את השם או קוד IATA.");
+        await requestAirlineCorrection(message, naturalSearch);
         return;
       }
       const response = await runFlightService({
@@ -127,9 +137,12 @@ async function executeNaturalSearch(message, naturalSearch) {
       await message.reply("⚠️ לא נמצאו טיסות עבור ההלוך או החזור.");
       return;
     }
-    sessions.set(message.from, { step: "roundTripResults", legs, activeLeg: 0 });
+    sessions.set(message.from, { step: "roundTripResults", legs, activeLeg: 0, checkOnly: Boolean(naturalSearch.checkOnly) });
     const summary = legs.map((leg) => `🔄 ${leg.label}:\n${renderFlight(leg.results[0], 0, leg.results.length, false)}`).join("\n\n");
-    await message.reply(`${summary}\n\nכתוב "הלוך" או "חזור" לבחירת מקטע, "הבא" או "הקודם" לשינוי הטיסה במקטע, "מעקב" לשמירת הטיסה המוצגת, או "ביטול".`);
+    const actions = naturalSearch.checkOnly
+      ? `כתוב "הלוך" או "חזור" לבחירת מקטע, "הבא" או "הקודם" לשינוי הטיסה במקטע, או "ביטול". זו בדיקה בלבד — לא יישמר מעקב.`
+      : `כתוב "הלוך" או "חזור" לבחירת מקטע, "הבא" או "הקודם" לשינוי הטיסה במקטע, "מעקב" לשמירת הטיסה המוצגת, או "ביטול".`;
+    await message.reply(`${summary}\n\n${actions}`);
     return;
   }
 
@@ -137,7 +150,7 @@ async function executeNaturalSearch(message, naturalSearch) {
     ? await runFlightService({ action: "airline_matches", text: naturalSearch.airline_text })
     : { matches: [] };
   if (naturalSearch.airline_text && !airlineResponse.matches.length) {
-    await message.reply("⚠️ לא זיהיתי את חברת התעופה. נסה לכתוב את השם או קוד IATA.");
+    await requestAirlineCorrection(message, naturalSearch);
     return;
   }
   const response = await runFlightService({
@@ -325,7 +338,7 @@ async function sendTripList(message) {
   const trips = response.trips || [];
   const unassigned = response.unassigned || [];
   if (!trips.length && !unassigned.length) {
-    await message.reply("📋 הרשימה שלך עדיין ריקה. כתוב למשל \"טיול לשוויץ\" כדי להתחיל.");
+    await message.reply("📋 הרשימה שלך עדיין ריקה. כתוב \"טיול חדש\" כדי להתחיל.");
     return;
   }
   const messages = buildTripListMessages({ trips, unassigned });
@@ -384,7 +397,7 @@ async function handleTripManagementSelection(message, action, trip) {
 async function beginTrip(message, name) {
   const tripName = name.trim().replace(/[.!?,]+$/, "");
   if (!tripName) {
-    await message.reply("כתוב שם לטיול, למשל: טיול לשוויץ.");
+    await message.reply("כתוב \"טיול חדש\" כדי להתחיל.");
     return;
   }
   const response = await runFlightService({ action: "create_trip", recipient_id: message.from, name: tripName });
@@ -453,15 +466,17 @@ client.on("message", async (message) => {
       "🔎 חיפוש בשיחה קצרה:\n" +
       "כתבו \"חיפוש\" ופעלו לפי השאלות: 🛫 המראה או נחיתה, 📍 יעד או מקור, 📅 תאריך, 🔢 מספר טיסה ו־🏷️ חברת תעופה.\n\n" +
       "⚡ חיפוש בהודעה אחת:\n" +
-      "אפשר לכתוב למשל:\n" +
-      "🛫 המראה מתל אביב לבטומי בתאריך 30.10.2026 עם חברת ארקיע\n" +
+      "כתבו במשפט אחד את כיוון הטיסה, היעד או המקור, התאריך ואת חברת התעופה או קוד IATA. אין רשימת ערים קשיחה בקוד; התוצאות מגיעות מלוח הטיסות של נתב״ג, ולכן יוצגו רק טיסות שמופיעות בו.\n" +
       "אם נמצאו טיסות בשעות שונות, אלון יבקש לבחור בוקר, צהריים, ערב או לילה; לאחר מכן יציג את פרטי הטיסה וישאל אם זו הטיסה שלכם.\n\n" +
+      "אם שם חברת התעופה לא זוהה, פרטי הטיסה נשארים בשיחה. אפשר לשלוח את התיקון בהודעה הבאה, גם בניסוח כמו \"התכוונתי ל־[שם החברה]\".\n\n" +
+      "🔎 בדיקה חד־פעמית ללא שמירה:\n" +
+      "כתבו בדיקה ואז שלחו את פרטי הטיסה, או התחילו את ההודעה במילה בדיקה וכתבו יעד או מקור, תאריך וחברת תעופה. הבוט יציג את התוצאה ולא ייצור טיול או מעקב. אפשר גם לכתוב בדיקת טיסה, אני רוצה בדיקה או אני צריך בדיקה.\n\n" +
       "💾 שמירת מעקב:\n" +
       "אחרי אישור שזו הטיסה, אלון ישאל בנפרד אם לשמור אותה ולעדכן אתכם. רק תשובת כן תשמור מעקב; בחיפוש טבעי הטיסה נשמרת תחת טיול כדי שאפשר יהיה להוסיף חזור בהמשך.\n" +
       "אחרי בחירת תוצאה אפשר לכתוב מעקב ✅. אם תימצא בהמשך תזוזה בשעה ⏰, שינוי בטרמינל 🚪, סטטוס 📊 או פרט אחר בלוח — תישלח הודעה 🔔.\n\n" +
       "📋 אפשרויות שימושיות:\n" +
       "📑 רשימה או הרשימה שלי — הצגת כל הטיולים והטיסות.\n" +
-      "🧳 טיול לשוויץ — פתיחת טיול חדש והוספת טיסות הלוך וחזור.\n" +
+      "🧳 טיול ל[שם הטיול] — פתיחת טיול חדש והוספת טיסות הלוך וחזור.\n" +
       "🛫 הלוך / 🛬 חזור — הוספת מקטע לטיול הפעיל; אחרי השמירה אפשר להוסיף מקטע נוסף או לסיים את הטיול.\n" +
       "📂 המשך טיול — הבוט ישאל לאיזה טיול להוסיף טיסה.\n" +
       "✅ סיום טיול — סיום ההוספה לטיול הפעיל.\n" +
@@ -477,12 +492,17 @@ client.on("message", async (message) => {
   }
 
   if (["help", "עזרה"].includes(command)) {
-    await message.reply("🤖 אפשר לכתוב: חיפוש, רשימה שלי, טיול חדש, המשך טיול, מחק טיול, ערוך טיול, בטל עדכונים, המשך עדכונים, ביטול, מדריך שימוש.");
+    await message.reply("🤖 אפשר לכתוב: בדיקה, חיפוש, רשימה שלי, טיול חדש, המשך טיול, מחק טיול, ערוך טיול, בטל עדכונים, המשך עדכונים, ביטול, מדריך שימוש.");
+    return;
+  }
+  if (isCheckOnlyCommand(command)) {
+    sessions.set(message.from, { step: "check_only_details", checkOnly: true });
+    await message.reply("🔎 בדיקה חד־פעמית: שלח במשפט אחד את כיוון הטיסה, היעד או המקור, התאריך וחברת התעופה או קוד IATA. לא אשמור טיול או מעקב.");
     return;
   }
   if (["טיול", "טיול חדש"].includes(command)) {
     sessions.set(message.from, { step: "trip_name" });
-    await message.reply("🧳 איך לקרוא לטיול? שלח שם, למשל \"שוויץ\" או \"חופשת קיץ\".");
+    await message.reply("🧳 איך לקרוא לטיול? שלח שם לבחירתך.");
     return;
   }
   const tripCreateMatch = message.body.trim().match(/^טיול\s+(?:ל|ב)\s*(.+)$/i);
@@ -567,14 +587,14 @@ client.on("message", async (message) => {
       sessions.delete(message.from);
       await message.reply(`✅ סיימנו להוסיף טיסות לטיול \"${session.tripName}\". כל הטיסות ששמרת ימשיכו להיות במעקב.`);
     } else {
-      await message.reply("ℹ️ אין כרגע טיול פעיל. כתוב למשל \"טיול לשוויץ\" כדי להתחיל.");
+      await message.reply("ℹ️ אין כרגע טיול פעיל. כתוב \"טיול חדש\" כדי להתחיל.");
     }
     return;
   }
   if (!session) {
     if (["הלוך", "טיסת הלוך"].includes(command)) {
       sessions.set(message.from, { step: "natural_outbound_details" });
-      await message.reply("מעולה. שלח את פרטי טיסת ההלוך במשפט חופשי, למשל: טס לציריך בתאריך 30.10.2026 עם חברת ארקיע.");
+      await message.reply("מעולה. שלח במשפט חופשי את פרטי טיסת ההלוך: יעד, תאריך וחברת תעופה או קוד IATA.");
       return;
     }
     const naturalSearch = parseNaturalFlightSearch(message.body);
@@ -607,10 +627,30 @@ client.on("message", async (message) => {
   }
 
   try {
+    if (session.step === "check_only_details") {
+      const checkSearch = parseNaturalFlightSearch(message.body);
+      if (!checkSearch) {
+        await message.reply("לא הצלחתי להבין את פרטי הטיסה. שלח יעד או מקור, תאריך וחברת תעופה או קוד IATA במשפט אחד.");
+        return;
+      }
+      checkSearch.checkOnly = true;
+      if (checkSearch.needsYear) {
+        sessions.set(message.from, { ...checkSearch, step: "natural_year", checkOnly: true });
+        await message.reply("📅 באיזו שנה הטיסה? כתוב למשל 2026.");
+        return;
+      }
+      if (!checkSearch.airline_text && !checkSearch.roundTrip) {
+        sessions.set(message.from, { ...checkSearch, step: "natural_airline", checkOnly: true });
+        await message.reply("🏷️ עם איזו חברת תעופה? כתוב את השם או קוד IATA.");
+        return;
+      }
+      await executeNaturalSearch(message, checkSearch);
+      return;
+    }
     if (session.step === "natural_outbound_details") {
       const outboundSearch = parseNaturalFlightSearch(message.body);
       if (!outboundSearch) {
-        await message.reply("לא הצלחתי להבין את פרטי ההלוך. נסה למשל: טס לציריך בתאריך 30.10.2026 עם חברת ארקיע.");
+        await message.reply("לא הצלחתי להבין את פרטי ההלוך. שלח יעד, תאריך וחברת תעופה או קוד IATA במשפט אחד.");
         return;
       }
       outboundSearch.movement = "departure";
@@ -716,7 +756,7 @@ client.on("message", async (message) => {
       if (session.editField === "airline") {
         const airlineResponse = await runFlightService({ action: "airline_matches", text: value });
         if (!airlineResponse.matches.length) {
-          await message.reply("⚠️ לא זיהיתי את חברת התעופה. נסה שוב.");
+          await message.reply("⚠️ לא זיהיתי את חברת התעופה. עריכת שדה החברה עדיין פתוחה; שלח שם או קוד IATA מתוקן.");
           return;
         }
         update.airline_name = airlineResponse.matches[0].name_en;
@@ -740,7 +780,7 @@ client.on("message", async (message) => {
     if (session.step === "trip_name") {
       const tripName = message.body.trim();
       if (!tripName) {
-        await message.reply("שלח שם לטיול, למשל \"שוויץ\".");
+    await message.reply("שלח שם לטיול לבחירתך.");
         return;
       }
       const response = await runFlightService({ action: "create_trip", recipient_id: message.from, name: tripName });
@@ -798,7 +838,7 @@ client.on("message", async (message) => {
       } else {
         const airlineResponse = await runFlightService({ action: "airline_matches", text: airlineText });
         if (!airlineResponse.matches.length) {
-          await message.reply("⚠️ לא זיהיתי את חברת התעופה. נסה שם אחר או כתוב \"לא יודע\".");
+          await message.reply("⚠️ לא זיהיתי את חברת התעופה. פרטי הטיסה לטיול נשארו פתוחים; שלח שם או קוד IATA מתוקן, או כתוב \"לא יודע\".");
           return;
         }
         session.airline = airlineResponse.matches[0];
@@ -887,6 +927,11 @@ client.on("message", async (message) => {
     }
     if (session.step === "natural_confirm_flight") {
       if (isYesAnswer(message.body)) {
+        if (session.checkOnly) {
+          sessions.delete(message.from);
+          await message.reply("✅ הבדיקה הושלמה. הטיסה לא נשמרה בטיול ולא הופעל עליה מעקב.");
+          return;
+        }
         if (session.flow === "return_builder") {
           session.returnFlight = session.selectedFlight;
           session.returnLocation = session.location;
@@ -929,7 +974,7 @@ client.on("message", async (message) => {
       if (isYesAnswer(message.body)) {
         session.flow = "return_builder";
         session.step = "natural_return_details";
-        await message.reply("מעולה. שלח את פרטי החזור במשפט חופשי, למשל: חוזר מציריך בתאריך 05.11.2026 עם חברת ארקיע.");
+        await message.reply("מעולה. שלח את פרטי טיסת החזור במשפט חופשי: עיר המוצא, תאריך וחברת תעופה או קוד IATA.");
         return;
       }
       await message.reply("יש גם טיסת חזור? כתוב כן או לא.");
@@ -951,7 +996,7 @@ client.on("message", async (message) => {
     if (session.step === "natural_return_details") {
       const returnSearch = parseNaturalFlightSearch(message.body);
       if (!returnSearch) {
-        await message.reply("לא הצלחתי להבין את פרטי החזור. נסה למשל: חוזר מציריך בתאריך 05.11.2026 עם חברת ארקיע.");
+        await message.reply("לא הצלחתי להבין את פרטי החזור. שלח עיר מוצא, תאריך וחברת תעופה או קוד IATA במשפט אחד.");
         return;
       }
       returnSearch.movement = "arrival";
@@ -1003,7 +1048,7 @@ client.on("message", async (message) => {
       const airlineText = message.body.trim();
       const airlineResponse = await runFlightService({ action: "airline_matches", text: airlineText });
       if (!airlineResponse.matches.length) {
-        await message.reply("⚠️ לא זיהיתי את חברת התעופה. נסה שוב עם שם החברה או קוד IATA.");
+        await message.reply("⚠️ לא זיהיתי את חברת התעופה. פרטי הטיסה עדיין שמורים בשיחה; נסה לשלוח שוב את שם החברה או קוד IATA, גם בניסוח כמו \"התכוונתי ל־[שם החברה]\".");
         return;
       }
       if (session.roundTrip) {
@@ -1037,6 +1082,10 @@ client.on("message", async (message) => {
         const leg = session.legs[session.activeLeg];
         leg.index = Math.max(0, leg.index - 1);
       } else if (["מעקב", "track"].includes(command)) {
+        if (session.checkOnly) {
+          await message.reply("זו בדיקה חד־פעמית, ולכן לא נשמר מעקב. אפשר להמשיך לבחור טיסה או לכתוב ביטול.");
+          return;
+        }
         const leg = session.legs[session.activeLeg];
         const selected = leg.results[leg.index];
         const response = await runFlightService({
@@ -1090,7 +1139,7 @@ client.on("message", async (message) => {
     if (session.step === "airline") {
       const airlineResponse = await runFlightService({ action: "airline_matches", text: message.body.trim() });
       if (!airlineResponse.matches.length) {
-        await message.reply("⚠️ לא זיהיתי את חברת התעופה. נסה שוב.");
+        await message.reply("⚠️ לא זיהיתי את חברת התעופה. החיפוש עדיין פתוח; שלח שם או קוד IATA מתוקן.");
         return;
       }
       session.airline = airlineResponse.matches[0];
