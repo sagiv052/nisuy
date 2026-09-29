@@ -119,7 +119,9 @@ test("natural flight search filters by day part, confirms identity and saving, a
   assert.match(bot.replies.at(-1), /EA101/);
 
   await bot.send("כן");
-  assert.match(bot.replies.at(-1), /לשמור את הטיסה למעקב/);
+  assert.match(bot.replies.at(-1), /יש גם טיסת חזור/);
+  await bot.send("לא");
+  assert.match(bot.replies.at(-1), /ליצור מהטיסה הזאת טיול/);
   await bot.send("כן");
 
   const createTrip = bot.calls.find((call) => call.action === "create_trip");
@@ -127,8 +129,7 @@ test("natural flight search filters by day part, confirms identity and saving, a
   assert.equal(createTrip.name, "טיול לZurich · 30.10.2026");
   assert.equal(addTrack.trip_id, 17);
   assert.equal(addTrack.flight_number, "EA101");
-  assert.match(bot.replies.at(-1), /המשך טיול 17/);
-  assert.match(bot.replies.at(-1), /חזור/);
+  assert.match(bot.replies.at(-1), /יצרתי את הטיול/);
 });
 
 test("declining tracking does not create a trip or save a flight", async () => {
@@ -137,7 +138,8 @@ test("declining tracking does not create a trip or save a flight", async () => {
   await bot.send("ערב");
   await bot.send("כן");
   await bot.send("לא");
+  await bot.send("לא");
   assert.equal(bot.calls.some((call) => call.action === "create_trip"), false);
   assert.equal(bot.calls.some((call) => call.action === "add_track"), false);
-  assert.match(bot.replies.at(-1), /לא שמרתי את הטיסה/);
+  assert.match(bot.replies.at(-1), /לא יצרתי טיול ולא הפעלתי עדכונים/);
 });

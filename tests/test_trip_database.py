@@ -55,6 +55,40 @@ class TripDatabaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.db.add_track("user-b", self.query("departure", "EA100"), trip_id=trip_id)
 
+    def test_can_rename_and_edit_a_users_trip_and_flight(self):
+        trip_id = self.db.create_trip("user-a", "Trip A")
+        track_id = self.db.add_track("user-a", self.query("departure", "EA100"), {"flight_number": "EA100"}, trip_id)
+        self.db.rename_trip("user-a", trip_id, "Trip Updated")
+        self.db.update_track("user-a", track_id, location="Geneva", flight_date="2026-11-01", flight_number="EA200", airline_name="Updated Air", airline_iata="UA")
+        trip = self.db.list_trips("user-a")[0]
+        track = self.db.list_tracks("user-a")[0]
+        self.assertEqual(trip["name"], "Trip Updated")
+        self.assertEqual(track["location"], "Geneva")
+        self.assertEqual(track["flight_date"], "2026-11-01")
+        self.assertEqual(track["flight_number"], "EA200")
+        self.assertIsNone(track["last_state"])
+
+    def test_delete_operations_are_user_scoped_and_trip_delete_cascades_tracks(self):
+        trip_id = self.db.create_trip("user-a", "Trip A")
+        track_id = self.db.add_track("user-a", self.query("departure", "EA100"), trip_id=trip_id)
+        with self.assertRaises(ValueError):
+            self.db.delete_track("user-b", track_id)
+        with self.assertRaises(ValueError):
+            self.db.delete_trip("user-b", trip_id)
+        self.db.delete_trip("user-a", trip_id)
+        self.assertEqual(self.db.list_trips("user-a"), [])
+        self.assertEqual(self.db.list_tracks("user-a"), [])
+
+    def test_trip_tracking_can_be_paused_and_resumed(self):
+        trip_id = self.db.create_trip("user-a", "Trip A")
+        track_id = self.db.add_track("user-a", self.query("departure", "EA100"), trip_id=trip_id)
+        self.assertEqual(self.db.all_tracks()[0]["trip_tracking_enabled"], 1)
+        self.db.set_trip_tracking("user-a", trip_id, False)
+        self.assertEqual(self.db.all_tracks()[0]["trip_tracking_enabled"], 0)
+        self.db.set_trip_tracking("user-a", trip_id, True)
+        self.assertEqual(self.db.all_tracks()[0]["trip_tracking_enabled"], 1)
+        self.assertEqual(self.db.get_track("user-a", track_id)["id"], track_id)
+
     def test_service_returns_only_the_requesting_users_trip_and_flights(self):
         trip_id = self.db.create_trip("user-a", "Trip A")
         self.db.create_trip("user-b", "Trip B")
