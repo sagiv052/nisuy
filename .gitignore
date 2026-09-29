@@ -5,6 +5,7 @@ browser-profile/
 .wwebjs_auth/
 .wwebjs_cache/
 node_modules/
+.npm-install-complete
 __pycache__/
 *.py[cod]
 .venv/

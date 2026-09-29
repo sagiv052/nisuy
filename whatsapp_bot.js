@@ -14,6 +14,10 @@ const chromeCandidates = [
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
   "/usr/bin/google-chrome",
   "/usr/bin/chromium",
+  "/usr/bin/chromium-browser",
+  process.env.PREFIX ? path.join(process.env.PREFIX, "bin", "chromium") : "",
+  process.env.PREFIX ? path.join(process.env.PREFIX, "bin", "chromium-browser") : "",
+  "/data/data/com.termux/files/usr/bin/chromium",
 ].filter(Boolean);
 const chromePath = chromeCandidates.find((candidate) => fs.existsSync(candidate));
 const pythonExecutable = process.env.PYTHON_EXECUTABLE || path.join(__dirname, ".venv", "bin", "python");

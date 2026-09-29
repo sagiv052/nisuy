@@ -10,11 +10,22 @@
 
 בהפעלה הראשונה הסקריפט מתקין את חבילות Node, יוצר סביבת Python מקומית ומתקין את התלויות מ־`requirements.txt`. נדרשים Node.js ו־Python 3; אם מגדירים `PYTHON_EXECUTABLE`, הסקריפט ישתמש בו במקום בסביבת ברירת המחדל.
 
+### Termux / Android
+
+ב־Termux יש להתקין את דרישות המערכת פעם אחת לפני ההפעלה:
+
+```bash
+pkg update
+pkg install nodejs python chromium
+```
+
+הסקריפט מדלג בכוונה על הורדת Chromium של Puppeteer, שאינה נתמכת ב־Termux, ומשתמש ב־Chromium שהותקן דרך `pkg`. אם מותקן דפדפן במיקום אחר, הגדירו את הנתיב ב־`CHROME_PATH` בתוך `.env`.
+
 להגדרות מותאמות, העתיקו את `.env.example` לקובץ `.env` ועדכנו בו את הערכים. הבוט טוען את ההגדרות גם בצד Node וגם בצד Python.
 
 ההפעלה נשארת פתוחה ומפעילה מחדש את הבוט אוטומטית אחרי שינוי בקבצי הקוד, בלי צורך להריץ שוב. להפעלה חד־פעמית ללא watcher השתמש ב־`./runwhatsapp.sh --once`.
 
-אם צריך להשתמש בגיבוי החיפוש דרך Playwright, התקן גם דפדפן Chromium פעם אחת: `./.venv/bin/python -m playwright install chromium`.
+אם צריך להשתמש בגיבוי החיפוש דרך Playwright, במחשב רגיל התקן גם דפדפן Chromium פעם אחת: `./.venv/bin/python -m playwright install chromium`. ב־Termux אין להריץ את פקודת ההורדה הזו; השתמשו ב־Chromium שהותקן עם `pkg` והשאירו את `CHROME_PATH` ריק או הגדירו את הנתיב שלו.
 
 בהפעלה הראשונה סורקים את ה־QR דרך WhatsApp > מכשירים מקושרים. בהפעלות הבאות ה־session נטען אוטומטית.
 
