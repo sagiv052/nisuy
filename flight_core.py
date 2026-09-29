@@ -202,13 +202,16 @@ class Database:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS whatsapp_trips (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient_id TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS whatsapp_trips (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient_id TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL, tracking_enabled INTEGER NOT NULL DEFAULT 1)")
             db.execute("CREATE TABLE IF NOT EXISTS whatsapp_tracks (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient_id TEXT NOT NULL, movement TEXT NOT NULL, location TEXT NOT NULL, flight_date TEXT NOT NULL, flight_number TEXT NOT NULL, airline_name TEXT NOT NULL, airline_iata TEXT NOT NULL, created_at TEXT NOT NULL, last_state TEXT, trip_id INTEGER, UNIQUE(recipient_id, movement, flight_date, flight_number))")
             columns = {row[1] for row in db.execute("PRAGMA table_info(whatsapp_tracks)")}
             if "last_state" not in columns:
                 db.execute("ALTER TABLE whatsapp_tracks ADD COLUMN last_state TEXT")
             if "trip_id" not in columns:
                 db.execute("ALTER TABLE whatsapp_tracks ADD COLUMN trip_id INTEGER")
+            trip_columns = {row[1] for row in db.execute("PRAGMA table_info(whatsapp_trips)")}
+            if "tracking_enabled" not in trip_columns:
+                db.execute("ALTER TABLE whatsapp_trips ADD COLUMN tracking_enabled INTEGER NOT NULL DEFAULT 1")
             db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_trips_recipient ON whatsapp_trips(recipient_id, created_at)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_whatsapp_tracks_recipient_trip ON whatsapp_tracks(recipient_id, trip_id, flight_date)")
 
@@ -236,6 +239,70 @@ class Database:
             db.row_factory = sqlite3.Row
             return [dict(row) for row in db.execute("SELECT * FROM whatsapp_tracks WHERE recipient_id=? AND trip_id IS NULL ORDER BY flight_date, id", (recipient_id,))]
 
+    def get_trip(self, recipient_id: str, trip_id: int) -> Optional[dict[str, Any]]:
+        with sqlite3.connect(self.path) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM whatsapp_trips WHERE id=? AND recipient_id=?", (trip_id, recipient_id)).fetchone()
+            return dict(row) if row else None
+
+    def get_track(self, recipient_id: str, track_id: int) -> Optional[dict[str, Any]]:
+        with sqlite3.connect(self.path) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT whatsapp_tracks.*, whatsapp_trips.name AS trip_name FROM whatsapp_tracks LEFT JOIN whatsapp_trips ON whatsapp_trips.id=whatsapp_tracks.trip_id WHERE whatsapp_tracks.id=? AND whatsapp_tracks.recipient_id=?", (track_id, recipient_id)).fetchone()
+            return dict(row) if row else None
+
+    def find_trip_by_name(self, recipient_id: str, name: str) -> Optional[dict[str, Any]]:
+        normalized = re.sub(r"\s+", " ", name).strip().casefold()
+        trips = self.list_trips(recipient_id)
+        exact = next((trip for trip in trips if trip["name"].casefold() == normalized), None)
+        if exact:
+            return exact
+        matches = [trip for trip in trips if normalized and normalized in trip["name"].casefold()]
+        return matches[0] if len(matches) == 1 else None
+
+    def set_trip_tracking(self, recipient_id: str, trip_id: int, enabled: bool) -> None:
+        with sqlite3.connect(self.path) as db:
+            cursor = db.execute("UPDATE whatsapp_trips SET tracking_enabled=? WHERE id=? AND recipient_id=?", (1 if enabled else 0, trip_id, recipient_id))
+            if cursor.rowcount == 0:
+                raise ValueError("Trip does not exist for this user")
+
+    def rename_trip(self, recipient_id: str, trip_id: int, name: str) -> None:
+        normalized_name = re.sub(r"\s+", " ", name).strip()
+        if not normalized_name:
+            raise ValueError("Trip name cannot be empty")
+        with sqlite3.connect(self.path) as db:
+            cursor = db.execute("UPDATE whatsapp_trips SET name=? WHERE id=? AND recipient_id=?", (normalized_name, trip_id, recipient_id))
+            if cursor.rowcount == 0:
+                raise ValueError("Trip does not exist for this user")
+
+    def update_track(self, recipient_id: str, track_id: int, *, location: Optional[str] = None, flight_date: Optional[str] = None, flight_number: Optional[str] = None, airline_name: Optional[str] = None, airline_iata: Optional[str] = None) -> None:
+        updates: dict[str, Any] = {}
+        for key, value in (("location", location), ("flight_date", flight_date), ("flight_number", flight_number), ("airline_name", airline_name), ("airline_iata", airline_iata)):
+            if value is not None:
+                updates[key] = value
+        if not updates:
+            raise ValueError("No flight changes supplied")
+        updates["last_state"] = None
+        assignments = ", ".join(f"{key}=?" for key in updates)
+        values = [updates[key] for key in updates] + [track_id, recipient_id]
+        with sqlite3.connect(self.path) as db:
+            cursor = db.execute(f"UPDATE whatsapp_tracks SET {assignments} WHERE id=? AND recipient_id=?", values)
+            if cursor.rowcount == 0:
+                raise ValueError("Flight does not exist for this user")
+
+    def delete_track(self, recipient_id: str, track_id: int) -> None:
+        with sqlite3.connect(self.path) as db:
+            cursor = db.execute("DELETE FROM whatsapp_tracks WHERE id=? AND recipient_id=?", (track_id, recipient_id))
+            if cursor.rowcount == 0:
+                raise ValueError("Flight does not exist for this user")
+
+    def delete_trip(self, recipient_id: str, trip_id: int) -> None:
+        with sqlite3.connect(self.path) as db:
+            if db.execute("SELECT 1 FROM whatsapp_trips WHERE id=? AND recipient_id=?", (trip_id, recipient_id)).fetchone() is None:
+                raise ValueError("Trip does not exist for this user")
+            db.execute("DELETE FROM whatsapp_tracks WHERE trip_id=? AND recipient_id=?", (trip_id, recipient_id))
+            db.execute("DELETE FROM whatsapp_trips WHERE id=? AND recipient_id=?", (trip_id, recipient_id))
+
     def add_track(self, recipient_id: str, query: FlightQuery, initial_state: Optional[dict[str, Any]] = None, trip_id: Optional[int] = None) -> int:
         airline = query.airline or {}
         last_state = json.dumps(initial_state, ensure_ascii=False, sort_keys=True) if initial_state else None
@@ -254,7 +321,7 @@ class Database:
     def all_tracks(self) -> list[dict[str, Any]]:
         with sqlite3.connect(self.path) as db:
             db.row_factory = sqlite3.Row
-            return [dict(row) for row in db.execute("SELECT whatsapp_tracks.*, whatsapp_trips.name AS trip_name FROM whatsapp_tracks LEFT JOIN whatsapp_trips ON whatsapp_trips.id=whatsapp_tracks.trip_id ORDER BY whatsapp_tracks.id")]
+            return [dict(row) for row in db.execute("SELECT whatsapp_tracks.*, whatsapp_trips.name AS trip_name, COALESCE(whatsapp_trips.tracking_enabled, 1) AS trip_tracking_enabled FROM whatsapp_tracks LEFT JOIN whatsapp_trips ON whatsapp_trips.id=whatsapp_tracks.trip_id ORDER BY whatsapp_tracks.id")]
 
     def update_state(self, track_id: int, state: dict[str, Any]) -> None:
         with sqlite3.connect(self.path) as db:

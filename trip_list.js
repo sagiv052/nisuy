@@ -23,7 +23,7 @@ function buildTripListMessages({ trips = [], unassigned = [] } = {}) {
   const messages = [`📋 הטיולים והטיסות שלך: ${trips.length} טיולים, ${flightCount} טיסות.`];
   for (const trip of trips) {
     const flights = trip.flights || [];
-    messages.push(`🧳 טיול: ${trip.name} · קוד ${trip.id} · ${flights.length} טיסות`);
+    messages.push(`🧳 טיול: ${trip.name} · ${flights.length} טיסות${trip.tracking_enabled === 0 ? " · עדכונים מושהים" : " · עדכונים פעילים"}`);
     if (!flights.length) messages.push("עדיין לא נשמרו טיסות בטיול הזה.");
     for (const flight of flights) messages.push(formatTrackedFlight(flight, trip.name));
   }

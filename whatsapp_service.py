@@ -33,6 +33,8 @@ async def search(payload: dict[str, Any]) -> None:
 async def check_tracks() -> None:
     events: list[dict[str, Any]] = []
     for track in core.DB.all_tracks():
+        if not track.get("trip_tracking_enabled", 1):
+            continue
         query = core.FlightQuery(track["movement"], track["location"], core.parse_date(track["flight_date"]), track["flight_number"], {"name_en": track["airline_name"], "iata": track["airline_iata"]})
         results = await core.BOARD.search(query)
         if not results:
@@ -85,6 +87,26 @@ def main() -> None:
     if action == "list_tracks":
         tracks = [dict(track) for track in core.DB.list_tracks(payload["recipient_id"])]
         output({"ok": True, "tracks": tracks})
+        return
+    if action == "rename_trip":
+        core.DB.rename_trip(payload["recipient_id"], int(payload["trip_id"]), payload["name"])
+        output({"ok": True})
+        return
+    if action == "update_track":
+        core.DB.update_track(payload["recipient_id"], int(payload["track_id"]), location=payload.get("location"), flight_date=payload.get("flight_date"), flight_number=payload.get("flight_number"), airline_name=payload.get("airline_name"), airline_iata=payload.get("airline_iata"))
+        output({"ok": True})
+        return
+    if action == "delete_track":
+        core.DB.delete_track(payload["recipient_id"], int(payload["track_id"]))
+        output({"ok": True})
+        return
+    if action == "delete_trip":
+        core.DB.delete_trip(payload["recipient_id"], int(payload["trip_id"]))
+        output({"ok": True})
+        return
+    if action == "set_trip_tracking":
+        core.DB.set_trip_tracking(payload["recipient_id"], int(payload["trip_id"]), bool(payload["enabled"]))
+        output({"ok": True})
         return
     if action == "check_tracks":
         asyncio.run(check_tracks())

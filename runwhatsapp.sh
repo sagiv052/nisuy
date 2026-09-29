@@ -2,15 +2,31 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+echo "מפעיל launcher מתוקן ל־Termux (Puppeteer ללא הורדת Chromium)..."
 
 if ! command -v node >/dev/null 2>&1; then
   echo "שגיאה: Node.js לא נמצא. התקן אותו מ־https://nodejs.org/ והפעל שוב."
   exit 1
 fi
 
-if [ ! -d "node_modules" ] || ! node -e 'require.resolve("dotenv"); require.resolve("whatsapp-web.js")' >/dev/null 2>&1; then
+is_termux=0
+if [ -n "${PREFIX:-}" ] && [[ "${PREFIX}" == */com.termux/* ]]; then
+  is_termux=1
+fi
+
+if [ ! -f ".npm-install-complete" ] || [ ! -d "node_modules" ] || ! node -e 'require.resolve("dotenv"); require.resolve("whatsapp-web.js")' >/dev/null 2>&1; then
   echo "מתקין חבילות WhatsApp Web בפעם הראשונה או מעדכן תלויות..."
-  npm install --no-audit --no-fund
+  # Puppeteer's bundled Chromium download is not supported on Termux. The bot
+  # uses the system Chromium instead (installed with: pkg install chromium).
+  PUPPETEER_SKIP_DOWNLOAD=true npm install --no-audit --no-fund --ignore-scripts
+  touch .npm-install-complete
+fi
+
+if [ "$is_termux" -eq 1 ]; then
+  if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1; then
+    echo "שגיאה: Chromium לא נמצא ב־Termux. התקן אותו עם: pkg update && pkg install chromium"
+    exit 1
+  fi
 fi
 
 python_override="${PYTHON_EXECUTABLE:-}"
@@ -36,7 +52,7 @@ elif [[ "$python_bin" != */* ]] && ! command -v "$python_bin" >/dev/null 2>&1; t
   exit 1
 fi
 
-if ! "$python_bin" -c 'import httpx, bs4, dotenv, playwright' >/dev/null 2>&1; then
+if ! "$python_bin" -c 'import httpx, bs4, dotenv' >/dev/null 2>&1; then
   echo "מתקין חבילות Python..."
   "$python_bin" -m pip install -r requirements.txt
 fi
