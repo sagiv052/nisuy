@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { buildTripListMessages } = require("../trip_list");
+const { parseNaturalFlightSearch } = require("../flight_parser");
 const timeSelection = require("../flight_time_selection");
 
 const botSource = fs.readFileSync(path.join(__dirname, "..", "whatsapp_bot.js"), "utf8");
@@ -37,7 +38,15 @@ function createBotHarness() {
         const payload = JSON.parse(raw);
         calls.push(payload);
         let response;
-        if (payload.action === "airline_matches") response = { ok: true, matches: [{ name_en: "Example Air", iata: "EA" }] };
+        if (payload.action === "airline_matches") {
+          const text = String(payload.text || "");
+          const matches = /אל\s*על|הלעל|\bLY\b/i.test(text)
+            ? [{ name_en: "EL AL Israel Airlines", iata: "LY" }]
+            : /Example Air|\bEA\b/i.test(text)
+              ? [{ name_en: "Example Air", iata: "EA" }]
+              : [];
+          response = { ok: true, matches };
+        }
         else if (payload.action === "search") response = { ok: true, results: searchResults };
         else if (payload.action === "create_trip") response = { ok: true, trip_id: 17 };
         else if (payload.action === "add_track") response = { ok: true, track_id: 91 };
@@ -58,15 +67,7 @@ function createBotHarness() {
     if (name === "qrcode-terminal") return { generate() {} };
     if (name === "dotenv") return { config() {} };
     if (name === "whatsapp-web.js") return { Client: FakeClient, LocalAuth: class {} };
-    if (name === "./flight_parser") {
-      return { parseNaturalFlightSearch: () => ({
-        movement: "departure",
-        location: "Zurich",
-        flight_date: "30.10.2026",
-        flight_number: "",
-        airline_text: "Example Air",
-      }) };
-    }
+    if (name === "./flight_parser") return { parseNaturalFlightSearch };
     if (name === "./trip_list") return { buildTripListMessages };
     if (name === "./flight_time_selection") return timeSelection;
     throw new Error(`Unexpected require: ${name}`);
@@ -126,7 +127,7 @@ test("natural flight search filters by day part, confirms identity and saving, a
 
   const createTrip = bot.calls.find((call) => call.action === "create_trip");
   const addTrack = bot.calls.find((call) => call.action === "add_track");
-  assert.equal(createTrip.name, "טיול לZurich · 30.10.2026");
+  assert.equal(createTrip.name, "טיול לציריך · 30.10.2026");
   assert.equal(addTrack.trip_id, 17);
   assert.equal(addTrack.flight_number, "EA101");
   assert.match(bot.replies.at(-1), /יצרתי את הטיול/);
@@ -142,4 +143,61 @@ test("declining tracking does not create a trip or save a flight", async () => {
   assert.equal(bot.calls.some((call) => call.action === "create_trip"), false);
   assert.equal(bot.calls.some((call) => call.action === "add_track"), false);
   assert.match(bot.replies.at(-1), /לא יצרתי טיול ולא הפעלתי עדכונים/);
+});
+
+test("check-only command recognizes El Al, searches the parsed city, and never saves a trip or tracking", async () => {
+  const bot = createBotHarness();
+  await bot.send("בדיקה");
+  assert.match(bot.replies.at(-1), /לא אשמור טיול או מעקב/);
+
+  await bot.send("אני טס לפראג ב12.10.2026 עם אל על");
+  const airlineCall = bot.calls.find((call) => call.action === "airline_matches");
+  const searchCall = bot.calls.find((call) => call.action === "search");
+  assert.equal(airlineCall.text, "אל על");
+  assert.equal(searchCall.location, "פראג");
+  assert.equal(searchCall.airline.iata, "LY");
+
+  await bot.send("בוקר");
+  assert.match(bot.replies.at(-1), /האם זו הטיסה שלך/);
+  await bot.send("כן");
+  assert.match(bot.replies.at(-1), /הבדיקה הושלמה/);
+  assert.equal(bot.calls.some((call) => call.action === "create_trip"), false);
+  assert.equal(bot.calls.some((call) => call.action === "add_track"), false);
+});
+
+test("a one-message בדיקה prefix finishes without asking about a return flight or trip", async () => {
+  const bot = createBotHarness();
+  await bot.send("בדיקה אני טס לפראג ב12.10.2026 עם אל על");
+  assert.match(bot.replies.at(-1), /באיזה חלק ביום/);
+  await bot.send("בוקר");
+  await bot.send("כן");
+  assert.match(bot.replies.at(-1), /הבדיקה הושלמה/);
+  assert.doesNotMatch(bot.replies.join("\n"), /יש גם טיסת חזור|ליצור מהטיסה הזאת טיול/);
+  assert.equal(bot.calls.some((call) => call.action === "create_trip"), false);
+  assert.equal(bot.calls.some((call) => call.action === "add_track"), false);
+});
+
+test("an unrecognized airline keeps the flight details active for a correction in the next message", async () => {
+  const bot = createBotHarness();
+  await bot.send("אני טס ללונדון בתאריך 12.10.2026 עם חברת חברה לא קיימת");
+  assert.match(bot.replies.at(-1), /שמרתי את פרטי הטיסה בשיחה/);
+  assert.equal(bot.calls.some((call) => call.action === "search"), false);
+
+  await bot.send("התכוונתי לאל על");
+  const search = bot.calls.find((call) => call.action === "search");
+  assert.equal(search.location, "לונדון");
+  assert.equal(search.flight_date, "12.10.2026");
+  assert.equal(search.airline.iata, "LY");
+  assert.match(bot.replies.at(-1), /מצאתי|באיזה חלק ביום/);
+});
+
+test("the common typo הלעל is resolved to EL AL without losing the flight request", async () => {
+  const bot = createBotHarness();
+  await bot.send("אני טס ללונדון בתאריך 12.10.2026 עם הלעל");
+  const airline = bot.calls.find((call) => call.action === "airline_matches");
+  const search = bot.calls.find((call) => call.action === "search");
+  assert.equal(airline.text, "הלעל");
+  assert.equal(search.location, "לונדון");
+  assert.equal(search.airline.iata, "LY");
+  assert.doesNotMatch(bot.replies.at(-1), /לא זיהיתי את חברת התעופה/);
 });

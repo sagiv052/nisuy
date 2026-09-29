@@ -11,6 +11,8 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
+from bs4 import BeautifulSoup
+
 TEST_ROOT = Path(tempfile.mkdtemp(prefix="flight-bot-tests-"))
 os.environ["FLIGHT_BOT_DB"] = str(TEST_ROOT / "module-default.sqlite3")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -142,6 +144,53 @@ class TripDatabaseTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 8)
         self.assertEqual(result["events"], [])
+
+
+class AirlineMatchingTests(unittest.TestCase):
+    def test_el_al_matches_hebrew_english_and_iata_aliases(self):
+        for text in ("אל על", "אלעל", "אל-על", "EL AL", "LY"):
+            with self.subTest(text=text):
+                matches = core.airline_matches(text)
+                self.assertEqual([item["iata"] for item in matches], ["LY"])
+
+    def test_airline_matcher_accepts_a_sentence_or_pasted_bot_question(self):
+        samples = (
+            "אני טס לפראג עם אל על",
+            "עם חברת אל על",
+            "אל על 🏷️ עם איזו חברת תעופה? כתוב את השם או קוד IATA.",
+            "התכוונתי לאל על",
+            "לא, אל על",
+            "טעיתי, אל על",
+        )
+        for text in samples:
+            with self.subTest(text=text):
+                matches = core.airline_matches(text)
+                self.assertEqual([item["iata"] for item in matches], ["LY"])
+
+    def test_common_one_character_airline_typo_is_resolved_conservatively(self):
+        matches = core.airline_matches("הלעל")
+        self.assertEqual([item["iata"] for item in matches], ["LY"])
+
+
+class CityResolutionTests(unittest.TestCase):
+    def test_city_resolver_uses_current_official_board_options(self):
+        form = BeautifulSoup(
+            '<form><select id="City"><option value="">All</option><option value="CPT">CAPE TOWN</option></select></form>',
+            "html.parser",
+        )
+        self.assertEqual(core.FlightBoardClient._official_city(form, "Cape Town"), ("CPT", "CAPE TOWN"))
+
+    def test_unknown_city_leaves_filter_empty_for_dynamic_all_city_search(self):
+        form = BeautifulSoup(
+            '<form><select id="City"><option value="">All</option><option value="CPT">CAPE TOWN</option></select></form>',
+            "html.parser",
+        )
+        self.assertEqual(core.FlightBoardClient._official_city(form, "Ushuaia"), ("", ""))
+
+    def test_city_matching_ignores_punctuation_and_diacritics(self):
+        query = core.FlightQuery("departure", "São-Paulo", date(2026, 10, 12))
+        row = {"date": "2026-10-12", "flight_number": "AB123", "airline": "Example", "location": "Sao Paulo"}
+        self.assertTrue(core.FlightBoardClient._matches(row, query))
 
 
 if __name__ == "__main__":
